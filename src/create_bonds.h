@@ -36,6 +36,7 @@ class CreateBonds : public Command {
   double rmin, rmax;
 
   void many();
+  void delaunay();
   void single_bond();
   void single_angle();
   void single_dihedral();

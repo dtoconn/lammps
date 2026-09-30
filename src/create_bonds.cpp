@@ -30,10 +30,43 @@
 #include "special.h"
 
 #include <cstring>
+#include <set>
+
+#include <CGAL/Simple_cartesian.h>
+
+#include <CGAL/Alpha_shape_2.h>
+#include <CGAL/Alpha_shape_3.h>
+#include <CGAL/Alpha_shape_vertex_base_2.h>
+#include <CGAL/Alpha_shape_vertex_base_3.h>
+
+#include <CGAL/Delaunay_triangulation_2.h>
+#include <CGAL/Delaunay_triangulation_3.h>
+#include <CGAL/Triangulation_vertex_base_with_info_2.h>
+#include <CGAL/Triangulation_vertex_base_with_info_3.h>
+
+typedef CGAL::Simple_cartesian<double> K;
+typedef K::Point_2 Point2;
+typedef K::Point_3 Point3;
+
+typedef CGAL::Triangulation_vertex_base_with_info_2<int, K> VbI2;
+typedef CGAL::Alpha_shape_vertex_base_2<K, VbI2> Vb2;
+typedef CGAL::Alpha_shape_face_base_2<K> Fb2;
+typedef CGAL::Triangulation_data_structure_2<Vb2, Fb2> Tds2;
+typedef CGAL::Delaunay_triangulation_2<K, Tds2> Delaunay2;
+typedef CGAL::Alpha_shape_2<Delaunay2> Alpha_shape2;
+
+typedef CGAL::Triangulation_vertex_base_with_info_3<int, K> VbI3;
+typedef CGAL::Alpha_shape_vertex_base_3<K, VbI3> Vb3;
+typedef CGAL::Alpha_shape_cell_base_3<K> Cb3;
+typedef CGAL::Triangulation_data_structure_3<Vb3, Cb3> Tds3;
+typedef CGAL::Delaunay_triangulation_3<K, Tds3> Delaunay3;
+typedef CGAL::Alpha_shape_3<Delaunay3> Alpha_shape3;
+
+static constexpr double BIG = 1e20;
 
 using namespace LAMMPS_NS;
 
-enum { MANY, SBOND, SANGLE, SDIHEDRAL, SIMPROPER };
+enum { MANY, DELAUNAY, SBOND, SANGLE, SDIHEDRAL, SIMPROPER };
 
 /* ---------------------------------------------------------------------- */
 
@@ -66,6 +99,12 @@ void CreateBonds::command(int narg, char **arg)
     rmax = utils::numeric(FLERR, arg[5], false, lmp);
     if (rmin > rmax) error->all(FLERR, "Inconsistent cutoffs for create_bonds many");
     iarg = 6;
+  } else if (strcmp(arg[0], "delaunay") == 0) {
+    style = DELAUNAY;
+    group1bit = group->get_bitmask_by_id(FLERR, arg[1], "create_bonds");
+    btype = utils::inumeric(FLERR, arg[2], false, lmp);
+    rmax = utils::numeric(FLERR, arg[3], false, lmp);
+    iarg = 4;
   } else if (strcmp(arg[0], "single/bond") == 0) {
     style = SBOND;
     btype = utils::inumeric(FLERR, arg[1], false, lmp);
@@ -113,11 +152,20 @@ void CreateBonds::command(int narg, char **arg)
   // optional args
 
   int specialflag = 1;
+  alpha = BIG;
 
   while (iarg < narg) {
     if (strcmp(arg[iarg], "special") == 0) {
       if (iarg + 2 > narg) error->all(FLERR, "Illegal create_bonds command");
       specialflag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "alpha") == 0) {
+      if (iarg + 2 > narg) error->all(FLERR, "Illegal create_bonds command");
+      if (style != DELAUNAY)
+        error->all(FLERR, "Alpha option only valid for delaunay style");
+      alpha = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      if (alpha <= 0)
+        error->all(FLERR, "Alpha must be positive and greater than zero");
       iarg += 2;
     } else
       error->all(FLERR, "Illegal create_bonds command");
@@ -125,7 +173,7 @@ void CreateBonds::command(int narg, char **arg)
 
   // error checks
 
-  if (style == MANY) {
+  if (style == MANY || style == DELAUNAY) {
     if (btype <= 0 || btype > atom->nbondtypes)
       error->all(FLERR, "Invalid bond type in create_bonds command");
     if (specialflag == 0) error->all(FLERR, "Cannot use special no with create_bonds many");
@@ -147,6 +195,8 @@ void CreateBonds::command(int narg, char **arg)
 
   if (style == MANY)
     many();
+  else if (style == DELAUNAY)
+    delaunay();
   else if (style == SBOND)
     single_bond();
   else if (style == SANGLE)
@@ -298,6 +348,159 @@ void CreateBonds::many()
       }
     }
   }
+  neighbor->init();
+
+  // recount bonds
+
+  bigint nbonds = 0;
+  for (i = 0; i < nlocal; i++) nbonds += num_bond[i];
+
+  MPI_Allreduce(&nbonds, &atom->nbonds, 1, MPI_LMP_BIGINT, MPI_SUM, world);
+  if (!force->newton_bond) atom->nbonds /= 2;
+
+  // print new bond count
+
+  bigint nadd_bonds = atom->nbonds - nbonds_previous;
+
+  if (comm->me == 0)
+    utils::logmesg(lmp, "Added {} bonds, new total = {}\n", nadd_bonds, atom->nbonds);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void CreateBonds::delaunay()
+{
+  // store state before bond creation
+
+  bigint nbonds_previous = atom->nbonds;
+
+  // init entire system since comm->borders and neighbor->build is done
+  // comm::init needs neighbor::init needs pair::init needs kspace::init, etc
+
+  lmp->init();
+
+  // setup domain, communication and neighboring, acquire ghosts
+
+  if (domain->triclinic) domain->x2lamda(atom->nlocal);
+  domain->pbc();
+  domain->reset_box();
+  comm->setup();
+  if (neighbor->style) neighbor->setup_bins();
+  comm->exchange();
+  comm->borders();
+  if (domain->triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
+
+  // Construct delaunay
+
+  int i, j, a;
+  int nlocal = atom->nlocal;
+  int ntotal = nlocal + atom->nghost;
+  int newton_bond = force->newton_bond;
+
+  int *mask = atom->mask;
+  tagint *tag = atom->tag;
+  double **x = atom->x;
+
+  std::set<std::pair<int, int>> new_bonds;
+
+  if (domain->dimension == 2) {
+    Delaunay2 dt;
+
+    // Create triangulation
+
+    for (i = 0; i < ntotal; i++) {
+      if (mask[i] & group1bit) {
+        Delaunay2::Vertex_handle vh = dt.insert(Point2(x[i][0], x[i][1]));
+        vh->info() = i;
+      }
+    }
+
+    Alpha_shape2 as(dt);
+    as.set_alpha(alpha);
+
+    // Extract a list of all unique edges
+
+    for (auto it = as.edges_begin(); it != as.edges_end(); it++) {
+      if (as.classify(*it) == Alpha_shape2::EXTERIOR) continue;
+
+      auto obj = it->first; // triangle
+      a = it->second;
+
+      // 2 vertices opposite a -> edge
+      auto v1 = obj->vertex(as.cw(a));
+      auto v2 = obj->vertex(as.ccw(a));
+
+      i = v1->info();
+      j = v2->info();
+
+      if (i < nlocal && (!newton_bond || tag[i] < tag[j]))
+        new_bonds.insert({i, j});
+
+      if (j < nlocal && (!newton_bond || tag[j] < tag[i]))
+        new_bonds.insert({j, i});
+    }
+  } else {
+    Delaunay3 dt;
+
+    // Create triangulation
+
+    for (i = 0; i < ntotal; i++) {
+      if (mask[i] & group1bit) {
+        Delaunay3::Vertex_handle vh = dt.insert(Point3(x[i][0], x[i][1], x[i][2]));
+        vh->info() = i;
+      }
+    }
+
+    Alpha_shape3 as(dt);
+    as.set_alpha(alpha);
+
+    // Extract a list of all unique edges
+
+    for (auto it = as.edges_begin(); it != as.edges_end(); it++) {
+      if (as.classify(*it) == Alpha_shape3::EXTERIOR) continue;
+
+      auto obj = it->first; // cell
+      auto v1 = obj->vertex(it->second);
+      auto v2 = obj->vertex(it->third);
+
+      i = v1->info();
+      j = v2->info();
+
+      if (i < nlocal && (!newton_bond || tag[i] < tag[j]))
+        new_bonds.insert({i, j});
+
+      if (j < nlocal && (!newton_bond || tag[j] < tag[i]))
+        new_bonds.insert({j, i});
+    }
+  }
+
+  double delx, dely, delz, rsq;
+  double rmaxsq = rmax * rmax;
+  int *num_bond = atom->num_bond;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  for (auto bond : new_bonds) {
+    i = bond.first;
+    j = bond.second;
+
+    delx = x[i][0] - x[j][0];
+    dely = x[i][1] - x[j][1];
+    delz = x[i][2] - x[j][2];
+    rsq = delx * delx + dely * dely + delz * delz;
+    if (rsq > rmaxsq) {
+      if (alpha == BIG)
+        error->warning(FLERR, "Bond too long for alpha setting");
+      continue;
+    }
+
+    if (num_bond[i] == atom->bond_per_atom)
+      error->one(FLERR, "New bond exceeded bonds per atom limit of {} in create_bonds in atom {} {} ",
+                atom->bond_per_atom, atom->tag[i], i);
+    bond_type[i][num_bond[i]] = btype;
+    bond_atom[i][num_bond[i]] = tag[j];
+    num_bond[i]++;
+  }
+
   neighbor->init();
 
   // recount bonds
