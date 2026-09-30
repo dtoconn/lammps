@@ -33,7 +33,7 @@ class CreateBonds : public Command {
   int group1bit, group2bit;
   int btype, atype, dtype;
   tagint batom1, batom2, aatom1, aatom2, aatom3, datom1, datom2, datom3, datom4;
-  double rmin, rmax;
+  double rmin, rmax, alpha;
 
   void many();
   void delaunay();
