@@ -32,6 +32,8 @@
 #include <cstring>
 #include <set>
 
+#include <boost/mpl/if.hpp>
+
 #include <CGAL/Simple_cartesian.h>
 
 #include <CGAL/Alpha_shape_2.h>
