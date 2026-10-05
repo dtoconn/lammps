@@ -76,7 +76,7 @@ void BondBPMCBM::store_data()
     for (m = 0; m < atom->num_bond[i]; m++) {
       type = bond_type[i][m];
 
-      //Skip if bond was turned off
+      // Skip if bond was turned off
       if (type <= 0) continue;
 
       // map to find index n
