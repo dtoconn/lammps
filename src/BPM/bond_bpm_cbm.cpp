@@ -20,6 +20,7 @@
 #include "fix_bond_history.h"
 #include "force.h"
 #include "memory.h"
+#include "modify.h"
 #include "neighbor.h"
 #include "update.h"
 
@@ -33,7 +34,8 @@ using namespace LAMMPS_NS;
 /* ---------------------------------------------------------------------- */
 
 BondBPMCBM::BondBPMCBM(LAMMPS *_lmp) :
-    BondBPM(_lmp), k(nullptr), ecrit(nullptr), gamma(nullptr)
+    BondBPM(_lmp), k(nullptr), ecrit(nullptr), gamma(nullptr),
+    id_fix_property_atom(nullptr)
 {
   partial_flag = 1;
   smooth_flag = 1;
@@ -55,6 +57,11 @@ BondBPMCBM::~BondBPMCBM()
 {
   delete[] svector;
 
+  if (id_fix_property_atom) {
+    modify->delete_fix(id_fix_property_atom);
+    delete[] id_fix_property_atom;
+  }
+
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(k);
@@ -69,69 +76,24 @@ BondBPMCBM::~BondBPMCBM()
 
 void BondBPMCBM::store_data()
 {
-  int i, j, m, type;
+  int i1, i2, i3, i4, i, j, m, n, n2, n3, n4, type, shared;
   double delx, dely, delz, r;
   double **x = atom->x;
-  int **bond_type = atom->bond_type;
-
-  for (i = 0; i < atom->nlocal; i++) {
-    for (m = 0; m < atom->num_bond[i]; m++) {
-      type = bond_type[i][m];
-
-      // Skip if bond was turned off
-      if (type <= 0) continue;
-
-      // map to find index n
-      j = atom->map(atom->bond_atom[i][m]);
-      if (j == -1) error->one(FLERR, "Atom missing in BPM bond");
-
-      delx = x[i][0] - x[j][0];
-      dely = x[i][1] - x[j][1];
-      delz = x[i][2] - x[j][2];
-
-      // Get closest image in case bonded with ghost
-      domain->minimum_image(FLERR, delx, dely, delz);
-      r = sqrt(delx * delx + dely * dely + delz * delz);
-
-      fix_bond_history->update_atom_value(i, m, 0, r);
-    }
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
-void BondBPMCBM::compute(int eflag, int vflag)
-{
-  pre_compute();
-
-  int i1, i2, i3, i4, itmp, n, n2, n3, n4, type, shared;
-  tagint tag1, tag2, tag3, tag4;
-  double delx, dely, delz, delvx, delvy, delvz;
-  double e, rsq, r, r0, rinv, smooth, fbond, ebond, dot;
-
-  ev_init(eflag, vflag);
 
   int *num_bond = atom->num_bond;
   int **bond_type = atom->bond_type;
   tagint **bond_atom = atom->bond_atom;
   tagint *tag = atom->tag;
-  double **x = atom->x;
-  double **v = atom->v;
-  double **f = atom->f;
-  int **bondlist = neighbor->bondlist;
-  int nbondlist = neighbor->nbondlist;
   int nlocal = atom->nlocal;
-  int newton_bond = force->newton_bond;
-  double dim = domain->dimension;
-  double invdim = 1.0 / dim;
 
-  double **bondstore = fix_bond_history->bondstore;
-  const bool allow_breaks = (update->setupflag == 0) && break_flag;
+  // initialization of atom/nodal volumes
+  double *vol = atom->dvector[index_vol];
 
-  // Identify tetrahedrons, order tag[i1] < tag[i2] < ...
-
+  // send bond data to ghosts for identification of tets
   comm->forward_comm(this);
 
+  // Identify tetrahedrons, order tag[i1] < tag[i2] < ...
+  tagint tag1, tag2, tag3, tag4;
   int ntet = 0;
   for (i1 = 0; i1 < nlocal; i1++) {
 
@@ -196,6 +158,58 @@ void BondBPMCBM::compute(int eflag, int vflag)
       }
     }
   }
+
+
+  for (i = 0; i < atom->nlocal; i++) {
+    for (m = 0; m < atom->num_bond[i]; m++) {
+      type = bond_type[i][m];
+
+      // Skip if bond was turned off
+      if (type <= 0) continue;
+
+      // map to find index n
+      j = atom->map(atom->bond_atom[i][m]);
+      if (j == -1) error->one(FLERR, "Atom missing in BPM bond");
+
+      delx = x[i][0] - x[j][0];
+      dely = x[i][1] - x[j][1];
+      delz = x[i][2] - x[j][2];
+
+      // Get closest image in case bonded with ghost
+      domain->minimum_image(FLERR, delx, dely, delz);
+      r = sqrt(delx * delx + dely * dely + delz * delz);
+
+      fix_bond_history->update_atom_value(i, m, 0, r);
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void BondBPMCBM::compute(int eflag, int vflag)
+{
+  pre_compute();
+
+  int i1, i2, itmp, n, type, shared;
+  tagint tag1, tag2, tag3, tag4;
+  double delx, dely, delz, delvx, delvy, delvz;
+  double e, rsq, r, r0, rinv, smooth, fbond, ebond, dot;
+
+  ev_init(eflag, vflag);
+
+  tagint *tag = atom->tag;
+  double **x = atom->x;
+  double **v = atom->v;
+  double **f = atom->f;
+  int **bondlist = neighbor->bondlist;
+  int nbondlist = neighbor->nbondlist;
+  int nlocal = atom->nlocal;
+  int newton_bond = force->newton_bond;
+  double dim = domain->dimension;
+  double invdim = 1.0 / dim;
+
+  double **bondstore = fix_bond_history->bondstore;
+  const bool allow_breaks = (update->setupflag == 0) && break_flag;
 
   // Calculate forces, currently just springs
 
@@ -343,6 +357,16 @@ void BondBPMCBM::init_style()
 
   if (domain->dimension == 2)
     error->all(FLERR, "Bond CBM currently only works in 3D");
+
+
+  if (!id_fix_property_atom) {
+    id_fix_property_atom = utils::strdup("BOND_BPM_CBM_FIX_PROPERTY_ATOM");
+    modify->add_fix(fmt::format("{} all property/atom d_vol ghost yes writedata no",
+                                id_fix_property_atom));
+
+    int tmp1 = 0, tmp2 = 0;
+    index_vol = atom->find_custom("vol", tmp1, tmp2);
+  }
 }
 
 /* ---------------------------------------------------------------------- */
