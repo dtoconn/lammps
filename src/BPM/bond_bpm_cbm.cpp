@@ -45,6 +45,8 @@ BondBPMCBM::BondBPMCBM(LAMMPS *_lmp) :
 
   single_extra = 1;
   svector = new double[1];
+
+  comm_forward = atom->bond_per_atom + 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -127,6 +129,8 @@ void BondBPMCBM::compute(int eflag, int vflag)
   const bool allow_breaks = (update->setupflag == 0) && break_flag;
 
   // Identify tetrahedrons, order tag[i1] < tag[i2] < ...
+
+  comm->forward_comm(this);
 
   int ntet = 0;
   for (i1 = 0; i1 < nlocal; i1++) {
@@ -476,4 +480,35 @@ double BondBPMCBM::single(int type, double rsq, int i, int j, double &fforce)
   svector[0] = r0;
 
   return ebond;
+}
+
+/* ---------------------------------------------------------------------- */
+
+int BondBPMCBM::pack_forward_comm(int n, int *list, double *buf, int /*pbc_flag*/, int * /*pbc*/)
+{
+  int m = 0;
+  int *num_bond = atom->num_bond;
+  tagint **bond_atom = atom->bond_atom;
+  for (int i = 0; i < n; i++) {
+    int j = list[i];
+    buf[m++] = ubuf(num_bond[i]).d;
+    for (int nb = 0; nb < num_bond[i]; nb++)
+      buf[m++] = ubuf(bond_atom[i][nb]).d;
+  }
+  return m;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void BondBPMCBM::unpack_forward_comm(int n, int first, double *buf)
+{
+  int m = 0;
+  int *num_bond = atom->num_bond;
+  tagint **bond_atom = atom->bond_atom;
+  int last = first + n;
+  for (int i = first; i < last; i++) {
+    num_bond[i] = ubuf(buf[m++]).i;
+    for (int nb = 0; nb < num_bond[i]; nb++)
+      bond_atom[i][nb] = (tagint) ubuf(buf[m++]).i;
+  }
 }
